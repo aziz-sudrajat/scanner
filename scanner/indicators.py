@@ -12,6 +12,23 @@ import numpy as np
 import pandas as pd
 
 
+def safe_last(series: pd.Series, default: float = 0.0) -> float:
+    """Ambil nilai terakhir series; fallback ke `default` jika NaN/inf.
+
+    Mencegah NaN dari indikator (data < period) meracuni skor secara diam-diam.
+    """
+    if series is None or len(series) == 0:
+        return default
+    v = series.iloc[-1]
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    if np.isnan(f) or np.isinf(f):
+        return default
+    return f
+
+
 # --------------------------------------------------------------------------- #
 # Moving averages
 # --------------------------------------------------------------------------- #
@@ -58,9 +75,32 @@ def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> 
 # Volume
 # --------------------------------------------------------------------------- #
 def volume_ratio(volume: pd.Series, window: int = 20) -> pd.Series:
-    """Current volume divided by its trailing average (`window`)."""
+    """Current volume divided by its trailing average (`window`).
+
+    NaN/inf (volume nol) diganti 1.0 = netral.
+    """
     avg = volume.rolling(window=window, min_periods=window).mean()
-    return volume / avg
+    ratio = volume / avg
+    return ratio.replace([np.inf, -np.inf], np.nan).fillna(1.0)
+
+
+# --------------------------------------------------------------------------- #
+# ATR (Average True Range) — volatilitas
+# --------------------------------------------------------------------------- #
+def atr(close: pd.Series, period: int = 14) -> pd.Series:
+    """Wilder ATR dari close saja (|close - prev_close| sebagai true range).
+
+    CoinGecko /market_chart tidak memberi H/L terpisah (O=H=L=C),
+    jadi true range = |close - close_prev|. Cukup untuk filter volatilitas.
+    """
+    tr = close.diff().abs()
+    return tr.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+
+
+def atr_pct(close: pd.Series, period: int = 14) -> pd.Series:
+    """ATR sebagai % dari harga — bisa dibandingkan antar koin."""
+    a = atr(close, period)
+    return (a / close.replace(0, np.nan) * 100.0).fillna(0.0)
 
 
 # --------------------------------------------------------------------------- #
@@ -68,6 +108,8 @@ def volume_ratio(volume: pd.Series, window: int = 20) -> pd.Series:
 # --------------------------------------------------------------------------- #
 def swing_levels(prices: pd.Series, lookback: int = 100) -> Tuple[float, float]:
     """Return (recent swing low, recent swing high) over the trailing window."""
+    if prices is None or len(prices) == 0:
+        raise ValueError("swing_levels: price series kosong")
     window = prices.values if len(prices) < lookback else prices.values[-lookback:]
     return float(np.min(window)), float(np.max(window))
 
@@ -75,10 +117,14 @@ def swing_levels(prices: pd.Series, lookback: int = 100) -> Tuple[float, float]:
 def pct_from_support(prices: pd.Series, lookback: int = 100) -> pd.Series:
     """Current price as % above the recent swing low."""
     low = swing_levels(prices, lookback)[0]
+    if low <= 0:
+        return pd.Series(0.0, index=prices.index)
     return (prices / low - 1.0) * 100.0
 
 
 def pct_from_resistance(prices: pd.Series, lookback: int = 100) -> pd.Series:
     """Current price as % below the recent swing high."""
     high = swing_levels(prices, lookback)[1]
+    if high <= 0:
+        return pd.Series(0.0, index=prices.index)
     return (prices / high - 1.0) * 100.0

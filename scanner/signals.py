@@ -19,7 +19,8 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from . import config as _cfg
-from .indicators import ema, rsi, macd, volume_ratio, pct_from_support, pct_from_resistance
+from .indicators import (ema, rsi, macd, volume_ratio, pct_from_support,
+                         pct_from_resistance, atr_pct, safe_last)
 
 # Signal tier labels
 SIGNAL_TIERS = ["STRONG_BUY", "BUY", "NEUTRAL", "SELL", "STRONG_SELL"]
@@ -35,16 +36,6 @@ STRONG_SELL_THRESHOLD = -35
 def to_score0100(net: float) -> float:
     """Map signed net (-100..100) to a 0..100 display score (higher = bullish)."""
     return round(max(0.0, min(100.0, net / 2.0 + 50.0)), 1)
-
-# Net score after clipping (signed, -100..100) -> used for classification only
-STRONG_BUY_THRESHOLD = 35
-BUY_THRESHOLD = 15
-NEUTRAL_RANGE = (-15, 15)
-SELL_THRESHOLD = -15
-STRONG_SELL_THRESHOLD = -35
-
-# ---- deprecated alias to keep older code paths working (0..100) ----
-NET_TO_SCORE0100 = 0.5
 
 
 @dataclass
@@ -147,7 +138,7 @@ def score_snapshot(snap: Dict[str, Any], name: str, symbol: str) -> SignalResult
         rsi14=0.0, macd_line=0.0, macd_hist=0.0, volume_ratio=0.0,
         pct_from_support=0.0, pct_from_resistance=0.0,
         pct_24h=pct_24h, volume_to_mcap=vol_activity,
-        volatility_24h=vol_pct, score=score, signal=signal,
+        volatility_24h=vol_pct, score=score, net=net, signal=signal,
         confidence=conf, factors=factors,
     )
 
@@ -169,26 +160,43 @@ def analyze(candle_df: pd.DataFrame, cfg: Any, coin_id: str, name: str, symbol: 
     vol_ratio = volume_ratio(volume, 20)
     pct_sup = pct_from_support(close)
     pct_res = pct_from_resistance(close)
+    atrp = atr_pct(close, 14)
 
-    p = {k: float(v.iloc[-1]) for k, v in {
-        "close": close, "ema50": ema50, "ema200": ema200, "ema20": ema20,
-        "ema12": ema12, "ema24": ema24, "rsi14": rsi14,
-        "macd_hist": macd_hist, "macd": macd_line, "vol_ratio": vol_ratio,
-        "pct_sup": pct_sup, "pct_res": pct_res,
-    }.items()}
+    # safe_last: cegah NaN (data < period) meracuni skor diam-diam.
+    # Default netral: ema→harga terakhir, rsi→50, sisanya→0.
+    last_close = safe_last(close, 0.0)
+    p = {
+        "close": last_close,
+        "ema50": safe_last(ema50, last_close),
+        "ema200": safe_last(ema200, last_close),
+        "ema20": safe_last(ema20, last_close),
+        "ema12": safe_last(ema12, last_close),
+        "ema24": safe_last(ema24, last_close),
+        "rsi14": safe_last(rsi14, 50.0),
+        "macd_hist": safe_last(macd_hist, 0.0),
+        "macd": safe_last(macd_line, 0.0),
+        "vol_ratio": safe_last(vol_ratio, 1.0),
+        "pct_sup": safe_last(pct_sup, 0.0),
+        "pct_res": safe_last(pct_res, 0.0),
+        "atr_pct": safe_last(atrp, 0.0),
+    }
 
     # ---- Trend sub-scores ----
     trend_price_above_ema200 = 25.0 if p["close"] > p["ema200"] else 0.0
     aligned_uptrend = 20.0 if (p["ema20"] > p["ema50"] > p["ema200"]) else 0.0
     short_momentum = 20.0 if (p["ema12"] > p["ema24"] > p["ema50"]) else 0.0
+    aligned_downtrend = 20.0 if (p["ema20"] < p["ema50"] < p["ema200"]) else 0.0
+    in_downtrend = aligned_downtrend > 0
 
     # ---- Momentum sub-scores ----
-    rsi = p["rsi14"]
-    if rsi < 30:
-        rsi_bull = 20.0
-    elif rsi < 50:
-        rsi_bull = 12.0 if rsi >= 35 else 20.0
-    elif rsi < 70:
+    rsi_val = p["rsi14"]
+    if rsi_val < 30:
+        # Oversold di downtrend kuat = falling knife, bukan bounce.
+        # Redam sinyal mean-reversion agar tidak mengalahkan trend.
+        rsi_bull = 5.0 if in_downtrend else 20.0
+    elif rsi_val < 50:
+        rsi_bull = 12.0 if rsi_val >= 35 else (5.0 if in_downtrend else 20.0)
+    elif rsi_val < 70:
         rsi_bull = 4.0
     else:
         rsi_bull = -15.0
@@ -201,12 +209,22 @@ def analyze(candle_df: pd.DataFrame, cfg: Any, coin_id: str, name: str, symbol: 
         vol_bull = 10.0
     else:
         vol_bull = 0.0
-    near_support = 15.0 if (p["pct_sup"] >= 0 and p["pct_sup"] <= 3.0) else 0.0
+    near_support = 0.0 if in_downtrend else (
+        15.0 if (p["pct_sup"] >= 0 and p["pct_sup"] <= 3.0) else 0.0)
+    # ATR%: volatilitas sehat = peluang; terlalu flat atau terlalu liar = risiko
+    atrv = p["atr_pct"]
+    if atrv < 0.5:
+        atr_score = -5.0    # koin mati, tidak ada peluang
+    elif atrv <= 8.0:
+        atr_score = 5.0     # volatilitas sehat
+    elif atrv <= 15.0:
+        atr_score = 0.0     # agak liar, netral
+    else:
+        atr_score = -10.0   # terlalu liar, berisiko
 
     bullish = (trend_price_above_ema200 + aligned_uptrend + short_momentum +
-               rsi_bull + macd_bull + vol_bull + near_support)
+               rsi_bull + macd_bull + vol_bull + near_support + atr_score)
 
-    aligned_downtrend = 20.0 if (p["ema20"] < p["ema50"] < p["ema200"]) else 0.0
     bearish = (aligned_downtrend +
                (15.0 if p["macd_hist"] < 0 else 0.0) +
                (15.0 if vol_ratio > 1.5 else 0.0) +
@@ -215,13 +233,13 @@ def analyze(candle_df: pd.DataFrame, cfg: Any, coin_id: str, name: str, symbol: 
     net_raw = bullish - bearish
     net = max(-100.0, min(100.0, net_raw))
 
-    if net >= config.STRONG_BUY_THRESHOLD:
+    if net >= _cfg.STRONG_BUY_THRESHOLD:
         signal = "STRONG_BUY"
-    elif net >= config.BUY_THRESHOLD:
+    elif net >= _cfg.BUY_THRESHOLD:
         signal = "BUY"
-    elif net <= config.STRONG_SELL_THRESHOLD:
+    elif net <= _cfg.STRONG_SELL_THRESHOLD:
         signal = "STRONG_SELL"
-    elif net <= config.SELL_THRESHOLD:
+    elif net <= _cfg.SELL_THRESHOLD:
         signal = "SELL"
     else:
         signal = "NEUTRAL"
@@ -241,6 +259,7 @@ def analyze(candle_df: pd.DataFrame, cfg: Any, coin_id: str, name: str, symbol: 
         "MACD_hist>0": macd_bull,
         "vol>1.5x": vol_bull,
         "near_support": near_support,
+        "atr_volatility": atr_score,
         "aligned_downtrend": aligned_downtrend,
         "macd_hist<0": (15.0 if p["macd_hist"] < 0 else 0.0),
         "vol>1.5x_dist": (15.0 if vol_ratio > 1.5 else 0.0),
@@ -250,7 +269,7 @@ def analyze(candle_df: pd.DataFrame, cfg: Any, coin_id: str, name: str, symbol: 
     return SignalResult(
         coin_id=coin_id, name=name, symbol=symbol.upper(), price=p["close"], timestamp=timestamp,
         ema50=p["ema50"], ema200=p["ema200"], ema20=p["ema20"], ema12=p["ema12"], ema24=p["ema24"],
-        rsi14=rsi, macd_line=p["macd"], macd_hist=p["macd_hist"],
+        rsi14=rsi_val, macd_line=p["macd"], macd_hist=p["macd_hist"],
         volume_ratio=vol_ratio, pct_from_support=pct_sup, pct_from_resistance=pct_res,
         pct_24h=0.0, volume_to_mcap=0.0, volatility_24h=0.0,
         net=net, score=to_score0100(net), signal=signal, confidence=conf, factors=factors,

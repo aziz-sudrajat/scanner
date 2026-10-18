@@ -11,6 +11,10 @@ CANDLE_INTERVAL = "daily"      # "daily" | "hourly"  (interval enum resmi CoinGe
 MAX_CANDLES = 200              # berapa banyak candle per koin (daily ~ maks 3650)
 FETCH_WORKERS = 1              # minimal: jaga agar tidak diejek rate limit API
 REQUEST_DELAY = 10.0           # detik jeda antar request (ikuti batas free tier)
+REQUEST_TIMEOUT = 20           # detik timeout per HTTP request
+REQUEST_RETRIES = 3            # berapa kali coba ulang saat gagal
+REQUEST_BACKOFF_BASE = 5.0     # detik base untuk exponential backoff (429)
+USER_AGENT = "signal-scanner/1.0 (+https://github.com/aziz-sudrajat/scanner)"
 
 
 # --- Coin universe -----------------------------------------------------
@@ -45,3 +49,36 @@ STRONG_SELL_THRESHOLD = -35
 EXPORT_CSV = True
 EXPORT_JSON = False
 COLUMN_WIDTH = 14
+
+
+# --- User config file override (pola dari azzx/core.py) -------------------
+# File JSON di ~/.config/signal-scanner/config.json dapat meng-override
+# nilai UPPER_CASE di atas. Contoh:
+#   {"STRONG_BUY_THRESHOLD": 50, "DEFAULT_LIMIT": 50, "REQUEST_DELAY": 5.0}
+import json as _json
+import os as _os
+
+USER_CONFIG_PATH = _os.path.expanduser("~/.config/signal-scanner/config.json")
+
+
+def load_user_config(path: str = USER_CONFIG_PATH) -> dict:
+    """Baca JSON config user; return {} jika tidak ada/rusak."""
+    if not path or not _os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = _json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def apply_user_config(path: str = USER_CONFIG_PATH) -> dict:
+    """Override konstanta UPPER_CASE module ini dari JSON. Return yang dipakai."""
+    overrides = load_user_config(path)
+    applied = {}
+    for key, val in overrides.items():
+        if key.isupper() and key in globals():
+            globals()[key] = val
+            applied[key] = val
+    return applied
