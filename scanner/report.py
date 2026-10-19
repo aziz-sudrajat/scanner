@@ -9,10 +9,11 @@ from __future__ import annotations
 import csv
 import io
 import json
+import math
 import os
 import tempfile
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, Optional
 
 from .signals import SignalResult
 
@@ -43,6 +44,8 @@ def _fmt_price(v: float) -> str:
     if v is None:
         return "$-"
     v = float(v)
+    if not math.isfinite(v):
+        return "$-"
     if v >= 1000:
         return f"${v:,.0f}"
     if v >= 1:
@@ -54,12 +57,43 @@ def _fmt_price(v: float) -> str:
     return s if s != "$" else "$0"
 
 
+def _finite(v) -> Optional[float]:
+    """float(v) atau None bila None/NaN/inf/tak bisa dikonversi."""
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
 def _fmt_num(v: float, dec: int = 2) -> str:
-    return f"{v:,.{dec}f}"
+    f = _finite(v)
+    return f"{f:,.{dec}f}" if f is not None else "-"
 
 
 def _fmt_pct(v: float, dec: int = 2) -> str:
-    return f"{v:+,.{dec}f}%"
+    f = _finite(v)
+    return f"{f:+,.{dec}f}%" if f is not None else "-"
+
+
+def _fmt_sig(v: float, dec: int = 4) -> str:
+    """Angka signifikan adaptif: nol di ekor dibuang ('0.0035', bukan '0.00').
+
+    Untuk rasio/indikator skala kecil agar tetap terbaca.
+    """
+    f = _finite(v)
+    if f is None:
+        return "-"
+    s = f"{f:,.{dec}f}".rstrip("0").rstrip(".")
+    # "-0.0001" -> "-0"; "-0.5" harus tetap "-0.5"
+    return "0" if s in ("", "-0") else s
+
+
+def _fmt_int(v) -> str:
+    f = _finite(v)
+    return str(int(round(f))) if f is not None else "-"
 
 
 def _signal_badge(signal: str) -> str:
@@ -82,6 +116,9 @@ def _signal_colored(signal: str, width: int = 11) -> str:
 
 
 def _use_tech(results: Iterable[SignalResult]) -> bool:
+    # Heuristik lama: koin snapshot selalu punya ema50/rsi14 = 0.
+    # Lebih baik panggil render_table(..., tech=True/False) secara eksplisit;
+    # ini hanya fallback bila tech=None.
     results = list(results)
     return any(r.ema50 != 0 or r.rsi14 != 0 for r in results)
 
@@ -91,23 +128,42 @@ def _score(r: SignalResult) -> float:
     return getattr(r, "score", 0.0)
 
 
-def render_table(results: Iterable[SignalResult]) -> str:
-    """Build a aligned, color-coded console table."""
+def render_table(results: Iterable[SignalResult],
+                 tech: Optional[bool] = None,
+                 color: bool = True) -> str:
+    """Build a aligned, color-coded console table.
+
+    `tech`: True = kolom teknikal (EMA200/RSI/MACD), False = kolom snapshot
+    (24h%/Vol/Mc/Volty%). None = auto-detect via heuristik `_use_tech`.
+    `color`: False = tanpa kode ANSI (untuk pipe/file).
+    """
     results = list(results)
-    tech = _use_tech(results)
-    hdr = f"{'#':>3} | {'Code':>6} {'Name':<12} {'Price':>12} {'Score':>6} {'Signal':<11} {'Conf':>4}"
+    if tech is None:
+        tech = _use_tech(results)
+    hdr = (f"{'#':>3} | {'Code':>6} {'Name':<12} {'Price':>12} {'Score':>6} "
+           f"{'Signal':<11} {'Conf':>4}")
     if tech:
-        hdr += f" | {'EMA200':>8} {'RSI':>5} {'MACD':>7}"
+        hdr += f" | {'EMA200':>12} {'RSI':>5} {'MACD':>10}"
     else:
         hdr += f" | {'24h%':>7} {'Vol/Mc':>7} {'Volty%':>6}"
     lines = [hdr, "-" * len(hdr)]
+    if not results:
+        lines.append("(no results)")
+        return "\n".join(lines)
     for i, r in enumerate(results, start=1):
+        badge = (_signal_colored(r.signal) if color
+                 else _signal_badge(r.signal).ljust(11))
         row = (f"{i:>3} | {r.symbol:>6} {r.name:<12} {_fmt_price(r.price):>12} "
-               f"{_score(r):>6.1f} {_signal_colored(r.signal)} {r.confidence:>4}")
+               f"{_fmt_num(_score(r), 1):>6} {badge} "
+               f"{_fmt_int(r.confidence):>4}")
         if tech:
-            row += f" | {_fmt_num(r.ema200):>8} {_fmt_num(r.rsi14):>5} {_fmt_num(r.macd_hist):>7}"
+            # EMA200 adaptif (koin murah tidak jadi 0.00), RSI 1 desimal,
+            # MACD signifikan adaptif.
+            row += (f" | {_fmt_price(r.ema200):>12} {_fmt_num(r.rsi14, 1):>5} "
+                    f"{_fmt_sig(r.macd_hist):>10}")
         else:
-            row += f" | {_fmt_pct(r.pct_24h):>7} {_fmt_num(r.volume_to_mcap):>7} {_fmt_num(r.volatility_24h):>6}"
+            row += (f" | {_fmt_pct(r.pct_24h):>7} {_fmt_sig(r.volume_to_mcap):>7} "
+                    f"{_fmt_num(r.volatility_24h):>6}")
         lines.append(row)
     return "\n".join(lines)
 
@@ -147,3 +203,14 @@ def export(results: Iterable[SignalResult], path: str, fmt: str = "csv") -> None
 def count_by_signal(results: Iterable[SignalResult]) -> dict:
     from collections import Counter
     return dict(Counter(r.signal for r in results))
+
+
+def print_json(results: Iterable[SignalResult]) -> None:
+    """Cetak hasil sebagai JSON ke stdout (pola azzx/cli_v10._print_json).
+
+    Untuk scripting/pipe: `python3 main.py --json | jq '.[0].signal'`.
+    Stdlib saja (tanpa rich); ensure_ascii=False agar nama koin utuh.
+    """
+    results = list(results)
+    print(json.dumps([r.__dict__ for r in results], indent=2,
+                     ensure_ascii=False, default=str))

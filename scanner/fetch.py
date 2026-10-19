@@ -7,15 +7,16 @@ Endpoints used:
   GET /coins/{id}/market_chart -> historical candles for indicator math
 """
 
+import random
 import time
-from typing import Iterable, List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional
 
 import requests
 
-from .config import (COINGECKO_BASE, VS_CURRENCY, REQUEST_DELAY,
+from .config import (COINGECKO_BASE, VS_CURRENCY,
                      REQUEST_TIMEOUT, REQUEST_RETRIES, REQUEST_BACKOFF_BASE,
                      USER_AGENT)
-from .cache import cached
+from .cache import cached, cache_peek
 
 
 class CoinGeckoError(Exception):
@@ -26,9 +27,47 @@ class CoinGeckoError(Exception):
         self.status_code = status_code
 
 
+def _retry_after_seconds(resp: Any) -> Optional[float]:
+    """Parse header Retry-After (detik). Return None bila tidak ada/invalid."""
+    try:
+        raw = resp.headers.get("Retry-After")
+    except Exception:  # noqa: BLE001 - headers bisa bukan mapping
+        return None
+    if raw is None:
+        return None
+    try:
+        return max(0.0, min(120.0, float(raw)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _sleep_backoff(attempt: int, retry_after: Optional[float] = None) -> float:
+    """Backoff eksponensial + jitter (pola azzx/providers.py: never infinite).
+
+    - Bila server memberi Retry-After: hormati, tambah jitter kecil.
+    - Selain itu: full jitter dalam [0, min(30, base * 2**attempt)] agar
+      retry berbarengan tidak "thundering herd".
+    Return lama tidur (untuk test/logging).
+    """
+    if retry_after is not None:
+        delay = min(retry_after + random.uniform(0, 1.0), 120.0)
+    else:
+        cap = min(30.0, REQUEST_BACKOFF_BASE * (2 ** attempt))
+        delay = random.uniform(0, cap)
+    time.sleep(delay)
+    return delay
+
+
 def _get(url: str, params: Optional[Dict[str, Any]] = None,
          tries: int = REQUEST_RETRIES) -> Any:
-    """GET helper with rate-limit (429) backoff and retry.
+    """GET helper dengan retry + backoff.
+
+    Kebijakan retry:
+      - 429            -> retry, hormati header Retry-After
+      - 5xx            -> retry (transient), bounded oleh `tries`
+      - 4xx lain       -> raise langsung (tidak retry; mis. 404 = coin tak ada)
+      - network error  -> retry, kecuali URL-nya sendiri invalid (bug)
+      - JSON invalid   -> raise langsung
 
     Returns parsed JSON (dict or list). Raises CoinGeckoError on failure.
     """
@@ -38,20 +77,30 @@ def _get(url: str, params: Optional[Dict[str, Any]] = None,
         try:
             resp = requests.get(url, params=params, headers=headers,
                                 timeout=REQUEST_TIMEOUT)
+        except (requests.exceptions.InvalidURL,
+                requests.exceptions.MissingSchema) as exc:
+            # Bug di URL/base config — retry tidak akan membantu.
+            raise CoinGeckoError(f"bad request URL: {exc}") from exc
         except requests.RequestException as exc:
             last_exc = exc
             if i < tries - 1:
-                # backoff eksponensial juga untuk network error
-                time.sleep(min(15.0, 2.0 * (2 ** i)))
+                _sleep_backoff(i)
             continue
         if resp.status_code == 429:
-            # rate limited - backoff eksponensial, lalu coba lagi
             if i < tries - 1:
-                time.sleep(min(30.0, REQUEST_BACKOFF_BASE * (2 ** i)))
+                _sleep_backoff(i, _retry_after_seconds(resp))
             else:
                 last_exc = CoinGeckoError(
                     f"rate limited (429) after {tries} tries",
                     status_code=429)
+            continue
+        if 500 <= resp.status_code < 600:
+            # Server error transient (502/503/504) — layak dicoba lagi.
+            last_exc = CoinGeckoError(
+                f"HTTP {resp.status_code}: {resp.text[:200]}",
+                status_code=resp.status_code)
+            if i < tries - 1:
+                _sleep_backoff(i)
             continue
         if resp.status_code >= 400:
             raise CoinGeckoError(
@@ -97,7 +146,10 @@ def fetch_snapshot(limit: int = 100) -> List[Dict[str, Any]]:
     def _all():
         out: List[Dict[str, Any]] = []
         page = 1
-        while len(out) < limit:
+        # Guard anti infinite-loop: bila API terus mengembalikan halaman penuh
+        # (bug server), berhenti setelah halaman yang dibutuhkan + 1 cadangan.
+        max_pages = (limit // 250) + 2
+        while len(out) < limit and page <= max_pages:
             chunk = _fetch_snapshot_page(limit, page)
             if not chunk:
                 break
@@ -109,16 +161,34 @@ def fetch_snapshot(limit: int = 100) -> List[Dict[str, Any]]:
     return _all()
 
 
+_OHLCV_TTL = 3600  # detik; samakan dengan cache_peek agar konsisten
+
+
+def _ohlcv_cache_params(coin_id: str, interval: str, days: int) -> Dict[str, Any]:
+    return {"coin": coin_id, "interval": interval, "days": days}
+
+
 def fetch_ohlcv(coin_id: str, interval: str = "daily", days: int = 200) -> List[Dict[str, Any]]:
     """Fetch OHLCV history for one coin.
 
     Returns a list of {time, open, high, low, close, volume} sorted oldest->newest.
     Di-cache ke disk 1 jam (env SCAN_NO_CACHE=1 untuk matikan).
     """
-    @cached("ohlcv", {"coin": coin_id, "interval": interval, "days": days}, ttl=3600)
+    @cached("ohlcv", _ohlcv_cache_params(coin_id, interval, days), ttl=_OHLCV_TTL)
     def _go():
         return _fetch_ohlcv_uncached(coin_id, interval, days)
     return _go()
+
+
+def ohlcv_cached(coin_id: str, interval: str = "daily",
+                 days: int = 200) -> tuple:
+    """Ambil OHLCV dari cache disk bila masih fresh, TANPA network.
+
+    Return (True, rows) bila hit, (False, None) bila miss/expired.
+    Dipakai worker agar tidak sleep rate-limiter sia-sia saat data sudah ada.
+    """
+    return cache_peek("ohlcv", _ohlcv_cache_params(coin_id, interval, days),
+                      _OHLCV_TTL)
 
 
 def _fetch_ohlcv_uncached(coin_id: str, interval: str, days: int) -> List[Dict[str, Any]]:
@@ -129,6 +199,9 @@ def _fetch_ohlcv_uncached(coin_id: str, interval: str, days: int) -> List[Dict[s
         raise CoinGeckoError(f"unexpected response shape for coin '{coin_id}': "
                              f"expected object, got {type(data).__name__}")
     prices = data.get("prices", [])
+    if not isinstance(prices, list):
+        raise CoinGeckoError(f"unexpected 'prices' shape for coin '{coin_id}': "
+                             f"expected list, got {type(prices).__name__}")
     if not prices:
         raise CoinGeckoError(f"no OHLCV data returned for coin '{coin_id}'")
     # normalize: CoinGecko returns [timestamp_ms, price]
@@ -153,10 +226,21 @@ def _fetch_ohlcv_uncached(coin_id: str, interval: str, days: int) -> List[Dict[s
         raise CoinGeckoError(
             f"no valid OHLCV rows for coin '{coin_id}' ({skipped} malformed rows skipped)")
     # CoinGecko also returns market_caps and total_volumes; align them by timestamp
-    caps = data.get("market_caps", [])
-    vol = data.get("total_volumes", [])
-    cap_by_ts = {t: c for t, c in caps}
-    vol_by_ts = {t: v for t, v in vol}
+    # (baris malformed di sini di-skip diam-diam — bukan data utama).
+    def _ts_map(key: str) -> Dict[Any, Any]:
+        m: Dict[Any, Any] = {}
+        rows = data.get(key, [])
+        if not isinstance(rows, list):
+            return m
+        for r in rows:
+            try:
+                t, v = r
+                m[int(t)] = float(v)
+            except (ValueError, TypeError):
+                continue
+        return m
+    cap_by_ts = _ts_map("market_caps")
+    vol_by_ts = _ts_map("total_volumes")
     for row in out:
         row["market_cap"] = cap_by_ts.get(row["time"], 0.0)
         row["total_volume"] = vol_by_ts.get(row["time"], 0.0)

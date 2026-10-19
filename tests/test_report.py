@@ -1,10 +1,12 @@
 """Tests untuk scanner/report.py — format & tabel."""
 import json
+import math
 import os
 import tempfile
 import unittest
 
-from scanner.report import _fmt_price, render_table, export, _atomic_write_text
+from scanner.report import (_fmt_price, _fmt_num, _fmt_pct, _fmt_sig, _fmt_int,
+                            render_table, export, _atomic_write_text)
 from scanner.signals import SignalResult
 
 
@@ -33,6 +35,35 @@ class TestFmtPrice(unittest.TestCase):
         self.assertEqual(_fmt_price(0), "$0")
         self.assertEqual(_fmt_price(None), "$-")
 
+    def test_nan_inf(self):
+        self.assertEqual(_fmt_price(float("nan")), "$-")
+        self.assertEqual(_fmt_price(float("inf")), "$-")
+
+
+class TestFmtGuards(unittest.TestCase):
+    def test_num_guards(self):
+        self.assertEqual(_fmt_num(None), "-")
+        self.assertEqual(_fmt_num(float("nan")), "-")
+        self.assertEqual(_fmt_num(float("inf")), "-")
+        self.assertEqual(_fmt_num(1.23456), "1.23")
+
+    def test_pct_guards(self):
+        self.assertEqual(_fmt_pct(None), "-")
+        self.assertEqual(_fmt_pct(float("nan")), "-")
+        self.assertEqual(_fmt_pct(5.5), "+5.50%")
+
+    def test_sig_strips_zeros(self):
+        self.assertEqual(_fmt_sig(0.0035), "0.0035")   # dulu "0.00"
+        self.assertEqual(_fmt_sig(0.12), "0.12")
+        self.assertEqual(_fmt_sig(0.0), "0")
+        self.assertEqual(_fmt_sig(-0.00001), "0")
+        self.assertEqual(_fmt_sig(-0.5), "-0.5")       # jangan jadi "0.5"
+        self.assertEqual(_fmt_sig(None), "-")
+
+    def test_int_guard(self):
+        self.assertEqual(_fmt_int(60.7), "61")
+        self.assertEqual(_fmt_int(None), "-")
+
 
 class TestRenderTable(unittest.TestCase):
     def test_snapshot_header(self):
@@ -54,6 +85,39 @@ class TestRenderTable(unittest.TestCase):
     def test_empty(self):
         t = render_table([])
         self.assertIn("#", t.split("\n")[0])
+        self.assertIn("(no results)", t)
+
+    def test_explicit_tech_param(self):
+        # mode eksplisit menang atas heuristik
+        t = render_table([mk()], tech=True)
+        self.assertIn("EMA200", t.split("\n")[0])
+        t = render_table([mk(tech=True)], tech=False)
+        self.assertIn("24h%", t.split("\n")[0])
+
+    def test_no_color_no_ansi(self):
+        t = render_table([mk()], color=False)
+        self.assertNotIn("\033[", t)
+        self.assertIn("BUY", t)
+
+    def test_color_has_ansi(self):
+        t = render_table([mk()], color=True)
+        self.assertIn("\033[", t)
+
+    def test_cheap_ema_visible(self):
+        # EMA koin murah tidak boleh jadi 0.00
+        t = render_table([mk(tech=True, price=0.00001234, ema200=0.00001111)],
+                         tech=True)
+        self.assertIn("0.00001111", t)
+
+    def test_small_vol_ratio_visible(self):
+        t = render_table([mk(volume_to_mcap=0.0035)])
+        self.assertIn("0.0035", t)
+
+    def test_none_fields_no_crash(self):
+        r = mk(price=None, pct_24h=None, volume_to_mcap=None,
+               volatility_24h=None, score=None, confidence=None)
+        t = render_table([r])  # tidak boleh raise
+        self.assertIn("$-", t)
 
 
 class TestExport(unittest.TestCase):
@@ -83,6 +147,63 @@ class TestExport(unittest.TestCase):
     def test_bad_format(self):
         with self.assertRaises(ValueError):
             export([mk()], "/tmp/x", "xml")
+
+
+class TestMisc(unittest.TestCase):
+    def test_signal_badge_unknown_passthrough(self):
+        from scanner.report import _signal_badge
+        self.assertEqual(_signal_badge("???"), "???")
+        self.assertEqual(_signal_badge("STRONG_BUY"), "STRONG BUY")
+
+    def test_count_by_signal_empty(self):
+        from scanner.report import count_by_signal
+        self.assertEqual(count_by_signal([]), {})
+
+    def test_count_by_signal(self):
+        from scanner.report import count_by_signal
+        out = count_by_signal([mk(signal="BUY"), mk(signal="BUY"),
+                               mk(signal="SELL")])
+        self.assertEqual(out, {"BUY": 2, "SELL": 1})
+
+    def test_csv_header_columns(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "o.csv")
+            export([mk()], p, "csv")
+            with open(p) as fh:
+                header = fh.readline().strip().split(",")
+        for col in ("rank", "coin_id", "score", "net", "signal",
+                    "confidence", "factors"):
+            self.assertIn(col, header)
+
+    def test_atomic_write_creates_parents(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "sub", "dir", "f.txt")
+            _atomic_write_text(p, "hello")
+            with open(p) as fh:
+                self.assertEqual(fh.read(), "hello")
+
+
+class TestPrintJson(unittest.TestCase):
+    def test_valid_json(self):
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            from scanner.report import print_json
+            print_json([mk(symbol="TST", signal="BUY")])
+        data = json.loads(buf.getvalue())
+        self.assertEqual(data[0]["symbol"], "TST")
+        self.assertEqual(data[0]["signal"], "BUY")
+        self.assertIn("factors", data[0])
+
+    def test_empty_list(self):
+        import io
+        from contextlib import redirect_stdout
+        from scanner.report import print_json
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            print_json([])
+        self.assertEqual(json.loads(buf.getvalue()), [])
 
 
 if __name__ == "__main__":

@@ -90,5 +90,89 @@ class TestAnalyze(unittest.TestCase):
         self.assertTrue(-100 <= sig.net <= 100)
 
 
+class TestSignalResultProps(unittest.TestCase):
+    def _r(self, signal):
+        return SignalResult(coin_id="x", name="X", symbol="X", price=1.0,
+                            timestamp="", ema50=0, ema200=0, ema20=0, ema12=0,
+                            ema24=0, rsi14=0, macd_line=0, macd_hist=0,
+                            volume_ratio=0, pct_from_support=0,
+                            pct_from_resistance=0, signal=signal)
+
+    def test_is_buy_sell(self):
+        self.assertTrue(self._r("BUY").is_buy)
+        self.assertTrue(self._r("STRONG_BUY").is_buy)
+        self.assertFalse(self._r("NEUTRAL").is_buy)
+        self.assertTrue(self._r("SELL").is_sell)
+        self.assertTrue(self._r("STRONG_SELL").is_sell)
+        self.assertFalse(self._r("NEUTRAL").is_sell)
+
+
+class TestScoreSnapshotEdges(unittest.TestCase):
+    def test_momentum_clamped(self):
+        # pump 500% -> momentum dibatasi +/-30
+        r = score_snapshot(snap(price_change_percentage_24h=500.0), "T", "t")
+        self.assertEqual(r.factors["24h_momentum"], 30.0)
+        r2 = score_snapshot(snap(price_change_percentage_24h=-500.0), "T", "t")
+        self.assertEqual(r2.factors["24h_momentum"], -30.0)
+
+    def test_zero_low_no_crash(self):
+        r = score_snapshot(snap(low_24h=0, high_24h=0), "T", "t")
+        self.assertEqual(r.volatility_24h, 0.0)
+        self.assertFalse(np.isnan(r.net))
+
+    def test_symbol_uppercased(self):
+        r = score_snapshot(snap(), "Test", "tst")
+        self.assertEqual(r.symbol, "TST")
+
+    def test_confidence_bounds(self):
+        r = score_snapshot(snap(), "T", "t")
+        self.assertTrue(5 <= r.confidence <= 95)
+
+    def test_sell_side_classification(self):
+        # dump ekstrem + rank jelek -> SELL/STRONG_SELL
+        r = score_snapshot(snap(price_change_percentage_24h=-30.0,
+                                market_cap_rank=250, total_volume=0,
+                                high_24h=100, low_24h=100), "T", "t")
+        self.assertIn(r.signal, ("SELL", "STRONG_SELL"))
+
+
+class TestAnalyzeEdges(unittest.TestCase):
+    def _df(self, n=250, trend=0.1):
+        return pd.DataFrame({
+            "close": [100.0 + i * trend + (i % 5) for i in range(n)],
+            "total_volume": [1000.0 + i for i in range(n)],
+        })
+
+    def test_volume_column_fallback(self):
+        # kolom 'volume' (bukan 'total_volume') tetap dipakai
+        df = pd.DataFrame({"close": [100.0 + i * 0.2 for i in range(250)],
+                           "volume": [500.0] * 250})
+        sig = analyze(df, cfg, "c", "C", "c", "ts-123")
+        self.assertEqual(sig.timestamp, "ts-123")
+        self.assertFalse(np.isnan(sig.volume_ratio))
+
+    def test_overbought_penalized(self):
+        # reli parabolik -> RSI > 70 -> faktor negatif, bukan NaN
+        df = pd.DataFrame({
+            "close": [100.0 * (1.05 ** i) for i in range(250)],
+            "total_volume": [1000.0] * 250,
+        })
+        sig = analyze(df, cfg, "c", "C", "c", "")
+        self.assertGreater(sig.rsi14, 70)
+        self.assertLess(sig.factors["RSI_30-50"], 0)
+
+    def test_flat_market_neutral(self):
+        df = pd.DataFrame({"close": [100.0] * 250,
+                           "total_volume": [1000.0] * 250})
+        sig = analyze(df, cfg, "c", "C", "c", "")
+        self.assertEqual(sig.rsi14, 50.0)
+
+    def test_factors_complete(self):
+        sig = analyze(self._df(), cfg, "c", "C", "c", "")
+        self.assertIn("atr_volatility", sig.factors)
+        self.assertIn("near_support", sig.factors)
+        self.assertTrue(5 <= sig.confidence <= 95)
+
+
 if __name__ == "__main__":
     unittest.main()
